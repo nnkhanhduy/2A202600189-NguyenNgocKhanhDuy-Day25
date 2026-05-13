@@ -22,11 +22,20 @@ def load_queries(path: str | Path = "data/sample_queries.jsonl") -> list[str]:
     return queries
 
 
-def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None = None) -> ReliabilityGateway:
+def build_gateway(
+    config: LabConfig,
+    provider_overrides: dict[str, float] | None = None,
+) -> ReliabilityGateway:
     providers = []
     for p in config.providers:
-        fail_rate = provider_overrides.get(p.name, p.fail_rate) if provider_overrides else p.fail_rate
-        providers.append(FakeLLMProvider(p.name, fail_rate, p.base_latency_ms, p.cost_per_1k_tokens))
+        fail_rate = (
+            provider_overrides.get(p.name, p.fail_rate)
+            if provider_overrides
+            else p.fail_rate
+        )
+        providers.append(
+            FakeLLMProvider(p.name, fail_rate, p.base_latency_ms, p.cost_per_1k_tokens)
+        )
     breakers = {
         p.name: CircuitBreaker(
             name=p.name,
@@ -74,6 +83,11 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
     gateway = build_gateway(config, scenario.provider_overrides or None)
     metrics = RunMetrics()
     request_count = config.load_test.requests
+    if scenario.name == "cache_stale_candidate" and gateway.cache is not None:
+        gateway.cache.set("Summarize refund policy for 2024 deadline", "Old refund policy")
+        cached, _ = gateway.cache.get("Summarize refund policy for 2026 deadline")
+        metrics.scenarios[scenario.name] = "pass" if cached is None else "fail"
+
     for _ in range(request_count):
         prompt = random.choice(queries)
         result = gateway.complete(prompt)
@@ -82,7 +96,7 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
         if result.cache_hit:
             metrics.cache_hits += 1
             metrics.estimated_cost_saved += 0.001
-        if result.route == "fallback":
+        if result.route.startswith("fallback"):
             metrics.fallback_successes += 1
             metrics.successful_requests += 1
         elif result.route == "static_fallback":
@@ -94,18 +108,17 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
             metrics.latencies_ms.append(result.latency_ms)
 
     metrics.circuit_open_count = sum(
-        1 for breaker in gateway.breakers.values() for t in breaker.transition_log if t["to"] == "open"
+        1
+        for breaker in gateway.breakers.values()
+        for t in breaker.transition_log
+        if t["to"] == "open"
     )
     metrics.recovery_time_ms = calculate_recovery_time_ms(gateway)
     return metrics
 
 
 def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
-    """Run all named scenarios from config, or a default run if none defined.
-
-    TODO(student): Add a cache vs no-cache comparison scenario.
-    Extend with your own custom scenarios (e.g., cost cap near limit).
-    """
+    """Run all named scenarios from config, plus cache stale-hit validation when enabled."""
     if not config.scenarios:
         default_scenario = ScenarioConfig(name="default", description="baseline run")
         metrics = run_scenario(config, queries, default_scenario)
@@ -113,12 +126,21 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
         return metrics
 
     combined = RunMetrics()
-    for scenario in config.scenarios:
+    scenarios = copy.deepcopy(config.scenarios)
+    if config.cache.enabled and not any(s.name == "cache_stale_candidate" for s in scenarios):
+        scenarios.append(
+            ScenarioConfig(
+                name="cache_stale_candidate",
+                description="Similar date-sensitive queries should not false-hit cache",
+            )
+        )
+
+    for scenario in scenarios:
         result = run_scenario(config, queries, scenario)
 
-        # TODO(student): Define pass/fail criteria per scenario.
-        # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
-        passed = result.successful_requests > 0
+        passed = _scenario_passed(scenario.name, result)
+        if scenario.name in result.scenarios:
+            passed = result.scenarios[scenario.name] == "pass" and passed
         combined.scenarios[scenario.name] = "pass" if passed else "fail"
 
         combined.total_requests += result.total_requests
@@ -135,6 +157,22 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
             if combined.recovery_time_ms is None:
                 combined.recovery_time_ms = result.recovery_time_ms
             else:
-                combined.recovery_time_ms = (combined.recovery_time_ms + result.recovery_time_ms) / 2
+                combined.recovery_time_ms = (
+                    combined.recovery_time_ms + result.recovery_time_ms
+                ) / 2
 
     return combined
+
+
+def _scenario_passed(name: str, metrics: RunMetrics) -> bool:
+    if name == "primary_timeout_100":
+        return (
+            metrics.circuit_open_count > 0
+            and metrics.fallback_successes > 0
+            and metrics.error_rate < 0.1
+        )
+    if name == "primary_flaky_50":
+        return metrics.circuit_open_count > 0 and metrics.successful_requests > 0
+    if name == "cache_stale_candidate":
+        return metrics.scenarios.get(name) == "pass"
+    return metrics.successful_requests > 0 and metrics.error_rate < 0.5

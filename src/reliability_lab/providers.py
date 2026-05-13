@@ -25,7 +25,13 @@ class FakeLLMProvider:
     This avoids real API keys while still simulating latency, failures, and cost.
     """
 
-    def __init__(self, name: str, fail_rate: float, base_latency_ms: int, cost_per_1k_tokens: float):
+    def __init__(
+        self,
+        name: str,
+        fail_rate: float,
+        base_latency_ms: int,
+        cost_per_1k_tokens: float,
+    ) -> None:
         self.name = name
         self.fail_rate = fail_rate
         self.base_latency_ms = base_latency_ms
